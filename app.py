@@ -2,195 +2,177 @@ import streamlit as st
 import numpy as np
 import cv2
 from PIL import Image, ExifTags
+import os
 import io
+import json
+import matplotlib.pyplot as plt
+import google.generativeai as genai
 
-st.set_page_config(page_title="TruthLens — MVP", layout="wide")
-st.title("🔍 TruthLens — MVP (Heuristic Authenticity Analyzer)")
-st.caption("Upload an image and optionally paste a related claim/caption. This MVP uses simple, explainable checks (no heavy AI yet).")
+# ---------- PAGE CONFIG ----------
+st.set_page_config(page_title="TruthLens v3.2 — AI Image Detector", layout="wide", page_icon="🤖")
 
-# ---------- Helpers ----------
+st.title("🤖 TruthLens  — AI-Powered Image Authenticity Detector")
+st.caption("Analyze and visualize the authenticity of any image using heuristic + Gemini AI scoring.")
+
+# ---------- GEMINI CONFIG ----------
+genai.configure(api_key="AIzaSyYOUR_REAL_GEMINI_KEY_HERE")  # Replace with your Gemini key
+
+# ---------- HELPER FUNCTIONS ----------
 def pil_to_cv(img_pil):
     arr = np.array(img_pil.convert("RGB"))
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
-def variance_of_laplacian(gray):
-    return cv2.Laplacian(gray, cv2.CV_64F).var()
+def variance_of_laplacian(gray): return cv2.Laplacian(gray, cv2.CV_64F).var()
 
 def left_right_symmetry(gray):
     h, w = gray.shape
     mid = w // 2
-    left = gray[:, :mid]
-    right = gray[:, w - mid:]
+    left, right = gray[:, :mid], gray[:, w - mid:]
     right_flipped = cv2.flip(right, 1)
-    # mean absolute difference normalized
-    mad = np.mean(np.abs(left.astype(np.float32) - right_flipped.astype(np.float32))) / 255.0
-    # smaller MAD => more symmetry
-    return mad
+    return np.mean(np.abs(left.astype(np.float32) - right_flipped.astype(np.float32))) / 255.0
 
 def image_entropy(gray):
-    hist = cv2.calcHist([gray],[0],None,[256],[0,256]).flatten()
-    p = hist / (np.sum(hist) + 1e-8)
-    p = p[p>0]
-    ent = -np.sum(p * np.log2(p))
-    return float(ent)  # 0..8 approx
+    hist = cv2.calcHist([gray],[0],None,[256],[0,256])
+    hist_norm = hist / hist.sum()
+    return -np.sum(hist_norm * np.log2(hist_norm + 1e-7))
 
-def get_exif_presence(pil_img):
+def extract_exif(image_pil):
     try:
-        exif = pil_img.getexif()
-        if exif is None or len(exif) == 0:
-            return False, 0
-        return True, len(exif)
-    except Exception:
-        return False, 0
+        exif = image_pil._getexif()
+        if exif:
+            return True, {ExifTags.TAGS.get(k,k):v for k,v in exif.items()}
+        return False, {}
+    except: return False, {}
 
-def clamp01(x): return max(0.0, min(1.0, float(x)))
+def ai_assess(signals):
+    prompt = f"""
+    Return a number between 0 and 1 showing chance of being AI-generated.
+    EXIF: {signals['exif_present']}
+    Blur: {signals['laplacian_variance']}
+    Symmetry: {signals['symmetry_mad']}
+    Entropy: {signals['entropy_bits']}
+    """
+    try:
+        r = genai.GenerativeModel("gemini-pro").generate_content(prompt)
+        val = float(r.text.strip())
+        return val if 0<=val<=1 else 0.5
+    except: return 0.5
 
-def analyze_image(pil_img):
-    cv_img = pil_to_cv(pil_img)
-    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+# ---------- SIDEBAR ----------
+st.sidebar.header("🧭 Navigation")
+up = st.sidebar.file_uploader("📤 Upload an Image", type=["jpg","jpeg","png"])
+run = st.sidebar.button("🚀 Analyze")
 
-    # EXIF
-    exif_present, exif_count = get_exif_presence(pil_img)
-    exif_risk = 0.7 if not exif_present else 0.0  # missing EXIF increases risk
+# ---------- MAIN ----------
+if run and up:
+    img = Image.open(up)
+    st.image(img, use_container_width=True)
 
-    # Blur/smoothness
-    lap_var = variance_of_laplacian(gray)
-    # If variance below ~150, likely smooth; normalize to risk 0..1
-    blur_risk = clamp01((150.0 - min(lap_var, 150.0)) / 150.0)
+    # Basic image facts
+    img_cv = pil_to_cv(img)
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    w, h = img.size
+    file_size = len(up.getvalue()) / 1024  # KB
 
-    # Symmetry (lower MAD => more symmetry => higher risk)
-    mad = left_right_symmetry(gray)
-    symmetry_risk = clamp01((0.15 - min(mad, 0.15)) / 0.15)
+    lap = variance_of_laplacian(gray)
+    ent = image_entropy(gray)
+    sym = left_right_symmetry(gray)
+    exif_ok, exif = extract_exif(img)
 
-    # Entropy (lower entropy => higher risk)
-    ent = image_entropy(gray)  # roughly 0..8
-    entropy_risk = clamp01((4.5 - min(ent, 4.5)) / 4.5)
+    # Heuristic scoring
+    risk = 0
+    if not exif_ok: risk += .25
+    if lap < 100:   risk += .25
+    if sym < .05:   risk += .25
+    if ent < 4:     risk += .25
+    heur = min(1.0, risk)
 
-    # Combine with weights
-    weights = {
-        "exif": 0.15,
-        "blur": 0.30,
-        "symmetry": 0.25,
-        "entropy": 0.30
-    }
-    final_risk = (
-        weights["exif"] * exif_risk +
-        weights["blur"] * blur_risk +
-        weights["symmetry"] * symmetry_risk +
-        weights["entropy"] * entropy_risk
-    )
+    ai_risk = ai_assess({
+        "exif_present": exif_ok, "laplacian_variance": lap,
+        "symmetry_mad": sym, "entropy_bits": ent
+    })
+    final = round(heur*0.6 + ai_risk*0.4, 2)
 
-    # Build explanations
-    reasons = []
-    if not exif_present:
-        reasons.append("No camera EXIF metadata detected (common in generated/edited images, but also in social media re-uploads).")
-    if blur_risk > 0.5:
-        reasons.append(f"Very smooth/low-detail regions (Laplacian variance ~ {lap_var:.1f}).")
-    if symmetry_risk > 0.5:
-        reasons.append(f"High left–right symmetry (MAD ~ {mad:.3f}).")
-    if entropy_risk > 0.5:
-        reasons.append(f"Low texture diversity/entropy (~ {ent:.2f} bits).")
+    # ---------- OVERLAY VERDICT ----------
+    verdict_text = "LIKELY REAL" if final < 0.4 else "POSSIBLY AI" if final < 0.7 else "LIKELY AI-GENERATED"
+    color = (0,255,0) if final < 0.4 else (0,165,255) if final < 0.7 else (0,0,255)
+    overlay_img = img_cv.copy()
+    cv2.putText(overlay_img, verdict_text, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+    st.image(cv2.cvtColor(overlay_img, cv2.COLOR_BGR2RGB), caption=f"Verdict: {verdict_text}", use_container_width=True)
 
-    return {
-        "final_risk": clamp01(final_risk),
-        "signals": {
-            "exif_present": exif_present,
-            "exif_count": int(exif_count),
-            "laplacian_variance": float(lap_var),
-            "symmetry_mad": float(mad),
-            "entropy_bits": float(ent)
-        },
-        "reasons": reasons
-    }
+    # ---------- METRICS ----------
+    st.markdown("## 📊 Detailed Metrics")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Blur Variance", f"{lap:.1f}")
+    c2.metric("Entropy", f"{ent:.2f}")
+    c3.metric("Symmetry MAD", f"{sym:.3f}")
+    c4.metric("AI Likelihood", f"{ai_risk*100:.1f}%")
 
-def analyze_claim(text):
-    if not text or text.strip() == "":
-        return {"risk": 0.0, "reasons": []}
-    t = text.strip()
-    risk = 0.0
-    reasons = []
+    # ---------- AI Confidence Bar ----------
+    st.markdown("### 🧠 AI Confidence Comparison")
+    st.write(f"🧍 Real: **{(1-final)*100:.1f}%** | 🤖 AI: **{final*100:.1f}%**")
+    bar = int(final * 50)
+    st.text("[" + "█"*bar + "░"*(50-bar) + "]")
 
-    # Heuristics
-    if sum(1 for c in t if c.isupper()) > 0.5 * len(t.replace(" ", "")):
-        risk += 0.2; reasons.append("Excessive UPPERCASE usage (sensational style).")
-    if t.count("!") >= 3:
-        risk += 0.2; reasons.append("Multiple exclamation marks (sensational style).")
-    clickbait = ["shocking", "you won't believe", "secret revealed", "breaking", "viral", "exposed"]
-    if any(kw in t.lower() for kw in clickbait):
-        risk += 0.2; reasons.append("Clickbait phrasing detected.")
-    hedges = ["experts say", "studies show", "researchers claim", "sources say"]
-    if any(kw in t.lower() for kw in hedges):
-        risk += 0.1; reasons.append("Vague sourcing/hedging language.")
-    if len(t) > 240:
-        risk += 0.1; reasons.append("Very long claim (often opinion or storytelling rather than factual).")
+    # ---------- HUMAN SUMMARY ----------
+    with st.container():
+        st.markdown(
+            f"""
+            <div style='background-color:#1C1F26;padding:15px;border-radius:12px'>
+            <h4>🧠 Human Summary</h4>
+            <p>
+            The image appears to have a <b>{(1-final)*100:.1f}% chance of being natural</b>
+            and a <b>{final*100:.1f}% chance of being AI-generated</b>.<br>
+            Blur variance of <b>{lap:.1f}</b> and entropy of <b>{ent:.2f}</b>
+            suggest {"good texture detail" if ent>5 else "smooth low-detail surfaces"}.
+            {("No EXIF data was found, a common sign of generated content."
+              if not exif_ok else "EXIF metadata is present, typical of real camera images.")}<br>
+            Overall verdict: <b>{verdict_text}</b>.
+            </p></div>
+            """, unsafe_allow_html=True
+        )
 
-    return {"risk": clamp01(risk), "reasons": reasons}
+    # ---------- EXTRA VISUALS ----------
+    st.markdown("### 📈 Histogram & Brightness Map")
+    fig, ax = plt.subplots(1, 2, figsize=(12, 4))
+    ax[0].hist(gray.ravel(), bins=256, color='cyan'); ax[0].set_title("Pixel Intensity Histogram")
+    ax[1].imshow(gray, cmap='gray'); ax[1].set_title("Grayscale Map"); ax[1].axis('off')
+    st.pyplot(fig)
 
-# ---------- UI ----------
-left, right = st.columns([1.3, 1])
-with left:
-    img_file = st.file_uploader("Upload image (JPG/PNG)", type=["jpg", "jpeg", "png"])
-    claim = st.text_area("Optional: paste a related claim/caption to analyze writing style", height=120, placeholder="e.g., BREAKING!!! Aliens spotted above Mumbai...")
-with right:
-    st.markdown("**How it works (MVP):**")
-    st.write("- Checks **EXIF, blur, symmetry, entropy** of the image")
-    st.write("- Optionally checks claim **tone/style** for sensational markers")
-    st.write("- Combines signals into a **risk score** (0 = authentic, 1 = likely synthetic/manipulated)")
+    st.markdown("### 🔥 Blur Heatmap")
+    lapmap = cv2.normalize(np.abs(cv2.Laplacian(gray, cv2.CV_64F)), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    st.image(lapmap, caption="Blur Intensity Heatmap", use_container_width=True)
 
-go = st.button("Analyze")
+    # ---------- IMAGE FACTS ----------
+    st.markdown("### 📷 Image Facts")
+    st.write(f"- **Resolution:** {w} × {h} pixels")
+    st.write(f"- **Aspect Ratio:** {w/h:.2f}")
+    st.write(f"- **File Size:** {file_size:.1f} KB")
+    st.write(f"- **Color Depth:** 3 channels (RGB)")
 
-if go:
-    if img_file is None and (not claim or claim.strip()==""):
-        st.warning("Please upload an image or paste a claim.")
-        st.stop()
+    # ---------- DOWNLOAD RESULTS ----------
+    st.markdown("### 📥 Download Your Analysis")
+# Convert all NumPy types to native Python types before JSON export
+    result = {
+        "verdict": str(verdict_text),
+        "ai_probability": float(final),
+        "blur_variance": float(lap),
+        "entropy": float(ent),
+        "symmetry_mad": float(sym),
+        "exif_present": bool(exif_ok),
+        "file_size_kb": float(round(file_size, 1)),
+        "resolution": f"{w}x{h}"
+}
 
-    img = None
-    if img_file is not None:
-        img = Image.open(io.BytesIO(img_file.read())).convert("RGB")
-        st.image(img, caption="Uploaded Image", use_column_width=True)
+    json_bytes = json.dumps(result, indent=4).encode("utf-8")
 
-    img_result = {"final_risk": 0.0, "signals": {}, "reasons": []}
-    if img is not None:
-        img_result = analyze_image(img)
+    st.download_button("⬇️ Download JSON Report", data=json_bytes, file_name="TruthLens_Report.json", mime="application/json")
 
-    claim_result = analyze_claim(claim)
-
-    # Combine overall
-    overall_risk = 0.0
-    if img is not None and claim.strip() != "":
-        overall_risk = clamp01(0.8 * img_result["final_risk"] + 0.2 * claim_result["risk"])
-    elif img is not None:
-        overall_risk = img_result["final_risk"]
-    else:
-        overall_risk = claim_result["risk"]
-
-    verdict = "Likely Authentic" if overall_risk < 0.5 else "Likely AI-Generated / Manipulated"
-    st.subheader("Result")
-    st.metric("Verdict", verdict, delta=f"Risk {overall_risk*100:.1f}%")
-
-    st.markdown("### Signals & Scores")
-    colA, colB, colC = st.columns(3)
-    with colA:
-        st.write("**Image signals**")
-        if img is None:
-            st.write("_No image uploaded._")
-        else:
-            st.json(img_result["signals"])
-    with colB:
-        st.write("**Image explanations**")
-        if img is None or not img_result["reasons"]:
-            st.write("_No strong red flags detected by heuristics._")
-        else:
-            for r in img_result["reasons"]:
-                st.write("• " + r)
-    with colC:
-        st.write("**Claim analysis**")
-        if not claim or claim.strip()=="":
-            st.write("_No claim provided._")
-        else:
-            st.write(f"Risk from writing style: **{claim_result['risk']*100:.0f}%**")
-            for r in claim_result["reasons"]:
-                st.write("• " + r)
-
+    # ---------- FOOTER ----------
     st.markdown("---")
-    st.caption("This MVP uses simple heuristics. Real photos can trigger false positives (e.g., social media strips EXIF). Use these signals as guidance, not absolute proof.")
+    st.caption("✨ TruthLens v3.2 — Smart. Simple. Stunning. Created by Hari priya ❤️")
+
+else:
+    st.info("Upload an image and click **Analyze** to start.")
+
+  
