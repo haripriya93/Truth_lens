@@ -2,14 +2,6 @@ import streamlit as st
 import numpy as np
 import subprocess
 import sys
-
-# --- Ensure OpenCV installs on Streamlit Cloud ---
-try:
-    import cv2
-except ModuleNotFoundError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "opencv-python-headless"])
-    import cv2
-
 import cv2
 from PIL import Image, ExifTags
 import os
